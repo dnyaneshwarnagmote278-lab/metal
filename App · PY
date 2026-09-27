@@ -1,0 +1,360 @@
+"""
+VisionInspect AI — Backend
+===========================
+Bridges the ESP32-CAM to the static website (index.html / script.js) with a
+small REST API, and runs the OpenCV defect analysis that was previously a
+standalone desktop app (see the original detection script this project is
+based on).
+
+Run:
+    pip install flask flask-cors opencv-python numpy requests
+    python app.py
+
+The frontend's Settings > AI Backend URL should point at this server
+(default: http://localhost:5000). The ESP32-CAM itself is reached directly
+from this backend using the IP the browser sends with each request, so this
+process must be able to reach your ESP32-CAM's Wi-Fi network.
+"""
+
+import time
+import json
+from pathlib import Path
+
+import cv2
+import numpy as np
+import requests
+from flask import Flask, request, jsonify, Response
+from flask_cors import CORS
+
+app = Flask(__name__)
+CORS(app)  # allow the GitHub Pages / local frontend to call this API
+
+BASE_DIR = Path(__file__).resolve().parent
+HISTORY_FILE = BASE_DIR / "history.json"
+CALIBRATION_FILE = BASE_DIR / "calibration.json"
+
+# ------------------------------------------------------------------
+# Detection tuning (mirrors the original desktop script's constants)
+# ------------------------------------------------------------------
+MIN_PART_AREA = 6000
+MIN_DEFECT_AREA = 120
+MIN_EDGE_DEPTH = 18
+MIN_SOLIDITY = 0.85
+
+DEFECT_LOCATIONS_X = ["Left", "Center", "Right"]
+DEFECT_LOCATIONS_Y = ["Top", "", "Bottom"]
+
+
+def load_json(path, default):
+    if path.exists():
+        try:
+            return json.loads(path.read_text())
+        except Exception:
+            return default
+    return default
+
+
+def save_json(path, data):
+    path.write_text(json.dumps(data, indent=2))
+
+
+calibration = load_json(CALIBRATION_FILE, {"px_per_mm": None})
+history = load_json(HISTORY_FILE, [])
+
+
+# ------------------------------------------------------------------
+# ESP32-CAM access
+# ------------------------------------------------------------------
+def camera_url(ip, port, endpoint):
+    port = str(port or "80")
+    port_part = f":{port}" if port and port != "80" else ""
+    endpoint = endpoint or "/capture"
+    if not endpoint.startswith("/"):
+        endpoint = "/" + endpoint
+    return f"http://{ip}{port_part}{endpoint}"
+
+
+def fetch_frame(ip, port, endpoint, timeout=4):
+    url = camera_url(ip, port, endpoint)
+    resp = requests.get(url, timeout=timeout)
+    resp.raise_for_status()
+    array = np.frombuffer(resp.content, dtype=np.uint8)
+    frame = cv2.imdecode(array, cv2.IMREAD_COLOR)
+    if frame is None:
+        raise ValueError("Camera returned data that isn't a decodable image")
+    return frame
+
+
+# ------------------------------------------------------------------
+# Analysis (adapted from the original find_paper / analyze_paper logic,
+# generalised to any part against a reasonably uniform background)
+# ------------------------------------------------------------------
+def find_part(frame, sensitivity=50):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    # Otsu threshold gives a background-agnostic starting point; sensitivity
+    # nudges the cutoff so users can tune for lighter/darker backgrounds.
+    otsu_val, _ = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    offset = (sensitivity - 50) * 0.6
+    _, mask = cv2.threshold(blur, max(0, min(255, otsu_val + offset)), 255, cv2.THRESH_BINARY_INV)
+
+    kernel = np.ones((5, 5), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)
+    part = contours[0]
+    if cv2.contourArea(part) < MIN_PART_AREA:
+        return None
+    return part
+
+
+def get_solidity(contour):
+    area = cv2.contourArea(contour)
+    if area <= 0:
+        return 0
+    hull = cv2.convexHull(contour)
+    hull_area = cv2.contourArea(hull)
+    if hull_area <= 0:
+        return 0
+    return area / hull_area
+
+
+def find_surface_defects(frame, part, threshold=50):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    h, w = gray.shape
+
+    part_mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.drawContours(part_mask, [part], -1, 255, cv2.FILLED)
+    inner_mask = cv2.erode(part_mask, np.ones((15, 15), np.uint8), iterations=1)
+
+    mean_val = cv2.mean(gray, mask=inner_mask)[0]
+    # Flag pixels that deviate strongly (bright holes/cuts OR dark gouges)
+    dev = 35 + (50 - threshold) * 0.4
+    bright = cv2.inRange(gray, mean_val + dev, 255)
+    dark = cv2.inRange(gray, 0, max(0, mean_val - dev - 20))
+    anomaly = cv2.bitwise_or(bright, dark)
+    anomaly = cv2.bitwise_and(anomaly, inner_mask)
+
+    k = np.ones((5, 5), np.uint8)
+    anomaly = cv2.morphologyEx(anomaly, cv2.MORPH_OPEN, k)
+    anomaly = cv2.morphologyEx(anomaly, cv2.MORPH_CLOSE, k)
+
+    contours, _ = cv2.findContours(anomaly, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    defects = []
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < MIN_DEFECT_AREA:
+            continue
+        x, y, dw, dh = cv2.boundingRect(c)
+        defects.append({"contour": c, "area": area, "x": x, "y": y, "w": dw, "h": dh})
+    return defects
+
+
+def find_edge_defects(contour):
+    result = []
+    if contour is None or len(contour) < 5:
+        return result
+    try:
+        hull_idx = cv2.convexHull(contour, returnPoints=False)
+        if hull_idx is None or len(hull_idx) < 3:
+            return result
+        raw = cv2.convexityDefects(contour, hull_idx)
+        if raw is None:
+            return result
+        raw = np.asarray(raw).reshape(-1, 4)
+        for d in raw:
+            depth = int(d[3]) / 256.0
+            if depth >= MIN_EDGE_DEPTH:
+                result.append({"far": int(d[2]), "depth": depth})
+    except Exception:
+        pass
+    return result
+
+
+def classify_location(frame_shape, x, y, w, h):
+    fh, fw = frame_shape[:2]
+    cx, cy = x + w / 2, y + h / 2
+    col = 0 if cx < fw / 3 else (1 if cx < 2 * fw / 3 else 2)
+    row = 0 if cy < fh / 3 else (1 if cy < 2 * fh / 3 else 2)
+    if row == 1 and col == 1:
+        return "Center"
+    parts = []
+    if row == 0:
+        parts.append("Top")
+    elif row == 2:
+        parts.append("Bottom")
+    if col == 0:
+        parts.append("Left")
+    elif col == 2:
+        parts.append("Right")
+    return "-".join(parts) if parts else "Center"
+
+
+def classify_defect_type(surface_defects, edge_defects, solidity):
+    if surface_defects:
+        biggest = max(surface_defects, key=lambda d: d["area"])
+        aspect = biggest["w"] / max(1, biggest["h"])
+        if 0.7 < aspect < 1.4 and biggest["area"] < 900:
+            return "Hole"
+        if biggest["area"] > 2500:
+            return "Cut"
+        return "Surface Defect"
+    if edge_defects and solidity < MIN_SOLIDITY:
+        return "Dent" if solidity > 0.72 else "Edge Damage"
+    return "Surface Defect"
+
+
+def classify_severity(defect_area_mm2, solidity):
+    if defect_area_mm2 is not None:
+        if defect_area_mm2 < 4:
+            return "Minor"
+        if defect_area_mm2 < 15:
+            return "Moderate"
+        return "Major"
+    if solidity > 0.82:
+        return "Minor"
+    if solidity > 0.65:
+        return "Moderate"
+    return "Major"
+
+
+def analyze(frame, px_per_mm=None, sensitivity=50, threshold=50):
+    part = find_part(frame, sensitivity)
+    if part is None:
+        return {"status": "NO_PART", "message": "No part detected in frame."}
+
+    solidity = get_solidity(part)
+    surface_defects = find_surface_defects(frame, part, threshold)
+    edge_defects = find_edge_defects(part)
+
+    is_bad = bool(surface_defects) or (edge_defects and solidity < MIN_SOLIDITY) or solidity < 0.65
+
+    x, y, w, h = cv2.boundingRect(part)
+    if surface_defects:
+        biggest = max(surface_defects, key=lambda d: d["area"])
+        loc = classify_location(frame.shape, biggest["x"], biggest["y"], biggest["w"], biggest["h"])
+        width_px, height_px = biggest["w"], biggest["h"]
+    else:
+        loc = classify_location(frame.shape, x, y, w, h) if is_bad else "—"
+        width_px, height_px = (w * (1 - solidity) * 2 or 10), (h * (1 - solidity) * 2 or 10)
+
+    defect_type = classify_defect_type(surface_defects, edge_defects, solidity) if is_bad else "None"
+    width_mm = (width_px / px_per_mm) if px_per_mm else None
+    height_mm = (height_px / px_per_mm) if px_per_mm else None
+    area_mm2 = (width_mm * height_mm) if (width_mm and height_mm) else None
+    severity = classify_severity(area_mm2, solidity) if is_bad else "None"
+
+    part_conf = min(0.99, 0.9 + solidity * 0.1)
+    defect_conf = 0.99 if not is_bad else min(0.99, 0.75 + len(surface_defects) * 0.05 + (0.1 if edge_defects else 0))
+    overall_conf = (part_conf + defect_conf) / 2
+
+    return {
+        "status": "BAD" if is_bad else "GOOD",
+        "defect_type": defect_type,
+        "location": loc,
+        "defect_count": len(surface_defects) + (1 if (edge_defects and solidity < MIN_SOLIDITY) else 0),
+        "severity": severity,
+        "solidity": round(solidity, 4),
+        "confidence_part": round(part_conf, 4),
+        "confidence_defect": round(defect_conf, 4),
+        "confidence_overall": round(overall_conf, 4),
+        "width_px": round(width_px, 2),
+        "height_px": round(height_px, 2),
+        "width_mm": round(width_mm, 2) if width_mm else None,
+        "height_mm": round(height_mm, 2) if height_mm else None,
+        "area_mm2": round(area_mm2, 2) if area_mm2 else None,
+    }
+
+
+# ------------------------------------------------------------------
+# Routes
+# ------------------------------------------------------------------
+@app.get("/api/status")
+def api_status():
+    return jsonify({
+        "backend": "online",
+        "time": time.time(),
+        "calibrated": calibration.get("px_per_mm") is not None,
+        "px_per_mm": calibration.get("px_per_mm"),
+        "history_count": len(history),
+    })
+
+
+@app.post("/api/connect")
+def api_connect():
+    data = request.get_json(force=True) or {}
+    ip, port, endpoint = data.get("ip"), data.get("port", "80"), data.get("endpoint", "/capture")
+    start = time.time()
+    try:
+        fetch_frame(ip, port, endpoint)
+        latency = round((time.time() - start) * 1000)
+        return jsonify({"connected": True, "latency_ms": latency})
+    except Exception as e:
+        return jsonify({"connected": False, "error": str(e)}), 502
+
+
+@app.get("/api/frame")
+def api_frame():
+    ip = request.args.get("ip")
+    port = request.args.get("port", "80")
+    endpoint = request.args.get("endpoint", "/capture")
+    try:
+        resp = requests.get(camera_url(ip, port, endpoint), timeout=4)
+        return Response(resp.content, mimetype="image/jpeg")
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+
+
+@app.post("/api/inspect")
+def api_inspect():
+    data = request.get_json(force=True) or {}
+    ip = data.get("ip")
+    port = data.get("port", "80")
+    endpoint = data.get("endpoint", "/capture")
+    px_per_mm = data.get("px_per_mm") or calibration.get("px_per_mm")
+    sensitivity = data.get("sensitivity", 50)
+    threshold = data.get("threshold", 50)
+
+    try:
+        frame = fetch_frame(ip, port, endpoint)
+    except Exception as e:
+        return jsonify({"error": f"Could not reach ESP32-CAM: {e}"}), 502
+
+    result = analyze(frame, px_per_mm=px_per_mm, sensitivity=sensitivity, threshold=threshold)
+    if result.get("status") == "NO_PART":
+        return jsonify(result), 200
+
+    record = dict(result)
+    record["id"] = f"INS-{len(history) + 1:04d}"
+    record["ts"] = time.time()
+    history.insert(0, record)
+    save_json(HISTORY_FILE, history[:500])
+
+    return jsonify(result)
+
+
+@app.get("/api/history")
+def api_history():
+    return jsonify(history)
+
+
+@app.post("/api/calibrate")
+def api_calibrate():
+    data = request.get_json(force=True) or {}
+    ref_mm = data.get("reference_mm")
+    ref_px = data.get("reference_px")
+    if not ref_mm or not ref_px:
+        return jsonify({"error": "reference_mm and reference_px are required"}), 400
+    calibration["px_per_mm"] = ref_px / ref_mm
+    save_json(CALIBRATION_FILE, calibration)
+    return jsonify(calibration)
+
+
+if __name__ == "__main__":
+    print("VisionInspect AI backend running on http://localhost:5000")
+    app.run(host="0.0.0.0", port=5000, debug=True)
