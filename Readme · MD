@@ -1,0 +1,67 @@
+# VisionInspect AI
+
+An animated, industrial-style dashboard for inspecting parts with an ESP32-CAM,
+plus a small Python/OpenCV backend that does the actual computer-vision work.
+
+## Files
+
+- `index.html`, `styles.css`, `script.js` — the website (static, deployable to GitHub Pages)
+- `app.py`, `requirements.txt` — optional local backend that talks to the ESP32-CAM and runs defect detection
+- `history.json`, `calibration.json` — created automatically by `app.py` to persist data
+
+## 1. Run the website
+
+You can just open `index.html` in a browser, or host the three frontend files
+on GitHub Pages (Settings → Pages → deploy from the branch containing these
+files). No build step, no Node server needed.
+
+## 2. Connect the ESP32-CAM
+
+On the Dashboard, enter your ESP32-CAM's IP (e.g. `192.168.1.10`), the port
+(usually `80`) and endpoint (usually `/capture`), then click **Connect
+Camera**. The site polls that URL to show a live feed and measure latency.
+
+Your computer/phone must be on the **same Wi-Fi network** as the ESP32-CAM.
+
+## 3. Run the AI backend (for real defect detection)
+
+The website can show a **demo/simulated** result on its own so you can present
+it without any setup. For real analysis of the camera image, run the backend:
+
+```bash
+pip install -r requirements.txt
+python app.py
+```
+
+This starts a local API on `http://localhost:5000`. In the website's
+**Settings → AI Backend URL**, keep it pointed at `http://localhost:5000`
+(or wherever you deploy `app.py`). The backend fetches frames directly from
+the ESP32-CAM, runs the OpenCV analysis (adapted from the original detection
+script), and returns a JSON result that the site renders, speaks, and logs.
+
+### API
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| GET | `/api/status` | backend + calibration status |
+| GET | `/api/frame` | proxy a single frame from the ESP32-CAM |
+| POST | `/api/connect` | test connectivity + latency |
+| POST | `/api/inspect` | capture + analyze a frame, returns result JSON |
+| GET | `/api/history` | inspection records the backend has saved |
+| POST | `/api/calibrate` | store a reference mm/px pair for measurement |
+
+## 4. Calibration
+
+Millimeter measurements are **visual estimates**, not calibrated metrology.
+In Settings, place a known reference object in frame, measure its width in
+pixels (e.g. from a captured image) and enter both values under
+**Calibration** to get a pixels-per-mm conversion.
+
+## Notes
+
+- The frontend keeps its own history/settings in the browser's local storage,
+  so it works standalone even without the backend running.
+- When the backend is reachable, inspections use real OpenCV analysis instead
+  of the demo simulator.
+- Voice announcements use the browser's built-in Speech Synthesis — no API
+  key or external service required.
