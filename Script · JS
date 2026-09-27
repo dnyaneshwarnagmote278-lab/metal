@@ -1,0 +1,747 @@
+/* ==========================================================
+   VisionInspect AI — Application Logic
+   Talks to: ESP32-CAM (image capture) + optional Python/OpenCV
+   backend (app.py) exposing /api/status /api/frame /api/connect
+   /api/inspect /api/history /api/calibrate.
+   Falls back to an on-device DEMO simulation when no backend
+   is reachable, so the UI stays fully interactive for demos.
+   ========================================================== */
+
+(() => {
+  "use strict";
+
+  /* ---------------- persisted state ---------------- */
+  const LS_KEY = "vi_state_v1";
+  const defaults = {
+    ip: "192.168.1.10",
+    port: "80",
+    endpoint: "/capture",
+    backend: "http://localhost:5000",
+    sensitivity: 50,
+    threshold: 50,
+    voiceEnabled: true,
+    volume: 100,
+    rate: 1.0,
+    autoSave: true,
+    autoInspect: false,
+    lightMode: false,
+    calRefMm: null,
+    calRefPx: null,
+    pxPerMm: null,
+    history: [],
+    connected: false,
+  };
+
+  let state = Object.assign({}, defaults, loadState());
+
+  function loadState() {
+    try {
+      const raw = localStorage.getItem(LS_KEY);
+      return raw ? JSON.parse(raw) : {};
+    } catch (e) { return {}; }
+  }
+  function saveState() {
+    try { localStorage.setItem(LS_KEY, JSON.stringify(state)); } catch (e) {}
+  }
+
+  /* ---------------- dom refs ---------------- */
+  const $ = (id) => document.getElementById(id);
+  const navItems = document.querySelectorAll(".nav-item");
+  const views = document.querySelectorAll(".view");
+
+  /* ---------------- navigation ---------------- */
+  navItems.forEach((item) => {
+    item.addEventListener("click", () => {
+      navItems.forEach((n) => n.classList.remove("active"));
+      item.classList.add("active");
+      const target = item.dataset.view;
+      views.forEach((v) => v.classList.toggle("active", v.id === "view-" + target));
+      $("sidebar").classList.remove("open");
+      if (target === "analytics") renderAnalytics();
+      if (target === "history") renderHistory();
+    });
+  });
+  $("menuBtn")?.addEventListener("click", () => $("sidebar").classList.toggle("open"));
+
+  /* ---------------- toast notifications ---------------- */
+  function toast(msg, type = "info", title = "") {
+    const stack = $("toastStack");
+    const el = document.createElement("div");
+    el.className = "toast " + type;
+    el.innerHTML = `<div>${title ? `<b>${title}</b><br>` : ""}${msg}</div>`;
+    stack.appendChild(el);
+    setTimeout(() => { el.style.opacity = "0"; el.style.transform = "translateX(20px)"; el.style.transition = "all .25s ease"; setTimeout(() => el.remove(), 260); }, 4200);
+  }
+
+  /* ---------------- form <-> state sync on load ---------------- */
+  function hydrateForm() {
+    $("ipInput").value = state.ip;
+    $("portInput").value = state.port;
+    $("endpointInput").value = state.endpoint;
+    $("backendInput").value = state.backend;
+    $("setIp").value = state.ip;
+    $("setEndpoint").value = state.endpoint;
+    $("setBackend").value = state.backend;
+    $("setSensitivity").value = state.sensitivity; $("sensVal").textContent = state.sensitivity;
+    $("setThreshold").value = state.threshold; $("threshVal").textContent = state.threshold;
+    $("setVoiceEnabled").checked = state.voiceEnabled;
+    $("voiceToggle").checked = state.voiceEnabled;
+    $("setVolume").value = state.volume; $("volVal").textContent = state.volume;
+    $("setRate").value = Math.round(state.rate * 10); $("rateVal").textContent = state.rate.toFixed(1);
+    $("setAutoSave").checked = state.autoSave;
+    $("setAutoInspect").checked = state.autoInspect;
+    $("setLightMode").checked = state.lightMode;
+    if (state.calRefMm && state.calRefPx) {
+      $("calRefMm").value = state.calRefMm;
+      $("calRefPx").value = state.calRefPx;
+      updateCalibUI();
+    }
+  }
+  hydrateForm();
+  renderHistory();
+  updateCounters(false);
+
+  /* ---------------- ESP32-CAM connection ---------------- */
+  let liveTimer = null;
+  let lastLatency = null;
+
+  function camUrl() {
+    const ip = $("ipInput").value.trim() || state.ip;
+    const port = $("portInput").value.trim() || "80";
+    const endpoint = ($("endpointInput").value.trim() || "/capture");
+    const portPart = (port && port !== "80") ? `:${port}` : "";
+    return `http://${ip}${portPart}${endpoint}`;
+  }
+
+  function setConnUI(connected, latencyMs) {
+    state.connected = connected;
+    $("statusVal").textContent = connected ? "CONNECTED" : "DISCONNECTED";
+    $("ipVal").textContent = connected ? $("ipInput").value : "—";
+    $("latencyVal").textContent = latencyMs != null ? `${latencyMs} ms` : "—";
+    $("lastConnVal").textContent = connected ? new Date().toLocaleTimeString() : $("lastConnVal").textContent;
+    $("pillDot").className = "pulse-indicator " + (connected ? "connected" : "disconnected");
+    $("pillDot2").className = "pulse-indicator " + (connected ? "connected" : "disconnected");
+    $("pillText").textContent = connected ? "Camera connected" : "Camera disconnected";
+    $("pillText2").textContent = connected ? "Camera connected" : "Camera disconnected";
+    $("sbCamStatus").innerHTML = `<i class="dot ${connected ? "on" : "off"}"></i>`;
+    $("camTag").textContent = connected ? "LIVE" : "OFFLINE";
+    ["connectBtn"].forEach((id) => $(id).disabled = connected);
+    $("disconnectBtn").disabled = !connected;
+    ["startInspectBtn", "captureBtn", "freezeBtn", "startInspectBtnBig", "captureBtnBig"].forEach((id) => $(id).disabled = !connected);
+    $("camPlaceholder").style.display = connected ? "none" : "flex";
+    $("camPlaceholderBig").style.display = connected ? "none" : "flex";
+    $("camImg").style.display = connected ? "block" : "none";
+    $("camImgBig").style.display = connected ? "block" : "none";
+    $("crosshair").style.display = connected ? "block" : "none";
+  }
+
+  function testConnection(showToast = true) {
+    return new Promise((resolve) => {
+      const start = performance.now();
+      const img = new Image();
+      const url = camUrl() + (camUrl().includes("?") ? "&" : "?") + "t=" + Date.now();
+      const timeout = setTimeout(() => { resolve({ ok: false, latency: null }); }, 4000);
+      img.onload = () => {
+        clearTimeout(timeout);
+        const latency = Math.round(performance.now() - start);
+        lastLatency = latency;
+        if (showToast) toast(`Reached ${camUrl()} in ${latency} ms`, "good", "Connection OK");
+        resolve({ ok: true, latency });
+      };
+      img.onerror = () => {
+        clearTimeout(timeout);
+        if (showToast) toast(`Could not reach ${camUrl()}`, "bad", "Connection failed");
+        resolve({ ok: false, latency: null });
+      };
+      img.src = url;
+    });
+  }
+
+  $("testBtn").addEventListener("click", () => testConnection(true));
+
+  $("connectBtn").addEventListener("click", async () => {
+    state.ip = $("ipInput").value.trim();
+    state.port = $("portInput").value.trim();
+    state.endpoint = $("endpointInput").value.trim();
+    state.backend = $("backendInput").value.trim();
+    saveState();
+    $("connectBtn").disabled = true;
+    $("connectBtn").textContent = "Connecting...";
+    const res = await testConnection(false);
+    $("connectBtn").textContent = "Connect Camera";
+    if (res.ok) {
+      setConnUI(true, res.latency);
+      startLiveFeed();
+      toast(`ESP32-CAM at ${state.ip} is streaming.`, "good", "Camera connected");
+      checkBackend();
+    } else {
+      setConnUI(false, null);
+      toast(`Check the IP, Wi-Fi, and that ${state.endpoint} responds.`, "bad", "ESP32-CAM not reachable");
+    }
+  });
+
+  $("disconnectBtn").addEventListener("click", () => {
+    stopLiveFeed();
+    setConnUI(false, null);
+    toast("Camera disconnected.", "info");
+  });
+
+  function startLiveFeed() {
+    stopLiveFeed();
+    const refresh = () => {
+      const url = camUrl() + (camUrl().includes("?") ? "&" : "?") + "t=" + Date.now();
+      $("camImg").src = url;
+      $("camImgBig").src = url;
+    };
+    refresh();
+    liveTimer = setInterval(refresh, 700);
+    let frames = 0;
+    const fpsTimer = setInterval(() => { $("sbFps").textContent = Math.round(frames / 2) + " fps"; frames = 0; }, 2000);
+    $("camImg").onload = () => frames++;
+    window.__viFpsTimer = fpsTimer;
+  }
+  function stopLiveFeed() {
+    if (liveTimer) clearInterval(liveTimer);
+    if (window.__viFpsTimer) clearInterval(window.__viFpsTimer);
+    $("sbFps").textContent = "—";
+  }
+
+  $("fullscreenBtn").addEventListener("click", () => {
+    const el = $("cameraFrame");
+    if (!document.fullscreenElement) el.requestFullscreen?.(); else document.exitFullscreen?.();
+  });
+
+  /* ---------------- AI backend status ---------------- */
+  let backendOnline = false;
+  async function checkBackend() {
+    try {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 2500);
+      const res = await fetch(state.backend.replace(/\/$/, "") + "/api/status", { signal: ctrl.signal });
+      clearTimeout(t);
+      backendOnline = res.ok;
+    } catch (e) { backendOnline = false; }
+    $("sbBackendStatus").innerHTML = `<i class="dot ${backendOnline ? "on" : "off"}"></i>`;
+    return backendOnline;
+  }
+  checkBackend();
+  setInterval(checkBackend, 15000);
+
+  /* ---------------- inspection sequence ---------------- */
+  const scanSteps = ["INITIALIZING CAMERA...", "DETECTING PART...", "ANALYZING SURFACE...", "MEASURING DEFECT...", "INSPECTION COMPLETE"];
+  let inspecting = false;
+
+  function showScanStatus(show) {
+    ["scanStatusLine", "scanStatusLineBig"].forEach((id) => $(id).classList.toggle("show", show));
+    ["cameraFrame", "cameraFrameBig"].forEach((id) => $(id).classList.toggle("scanning", show));
+  }
+  function setScanText(text) {
+    $("scanStatusText").textContent = text;
+    $("scanStatusTextBig").textContent = text;
+  }
+
+  async function runScanSequence() {
+    showScanStatus(true);
+    for (let i = 0; i < scanSteps.length - 1; i++) {
+      setScanText(scanSteps[i]);
+      await sleep(480);
+    }
+  }
+  function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+  async function startInspection() {
+    if (inspecting || !state.connected) return;
+    inspecting = true;
+    ["startInspectBtn", "startInspectBtnBig"].forEach((id) => $(id).disabled = true);
+    ["stopInspectBtn", "stopInspectBtnBig"].forEach((id) => $(id).disabled = false);
+
+    resetResultUI();
+    await runScanSequence();
+
+    const online = await checkBackend();
+    let result;
+    if (online) {
+      result = await inspectViaBackend();
+    } else {
+      result = simulateInspection();
+      toast("AI backend not reachable — showing a simulated demo result. Run app.py to get real analysis.", "info", "Demo mode");
+    }
+
+    setScanText("INSPECTION COMPLETE");
+    await sleep(300);
+    showScanStatus(false);
+
+    applyResult(result);
+
+    ["startInspectBtn", "startInspectBtnBig"].forEach((id) => $(id).disabled = false);
+    ["stopInspectBtn", "stopInspectBtnBig"].forEach((id) => $(id).disabled = true);
+    inspecting = false;
+  }
+
+  function stopInspection() {
+    inspecting = false;
+    showScanStatus(false);
+    ["startInspectBtn", "startInspectBtnBig"].forEach((id) => $(id).disabled = false);
+    ["stopInspectBtn", "stopInspectBtnBig"].forEach((id) => $(id).disabled = true);
+    toast("Inspection stopped.", "info");
+  }
+
+  async function inspectViaBackend() {
+    try {
+      const res = await fetch(state.backend.replace(/\/$/, "") + "/api/inspect", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ip: state.ip, port: state.port, endpoint: state.endpoint, px_per_mm: state.pxPerMm, sensitivity: state.sensitivity, threshold: state.threshold }),
+      });
+      if (!res.ok) throw new Error("bad status");
+      return await res.json();
+    } catch (e) {
+      toast("Backend responded with an error — falling back to demo result.", "bad", "Inspect failed");
+      return simulateInspection();
+    }
+  }
+
+  /* Demo/simulation generator so the UI works without the Python backend */
+  function simulateInspection() {
+    const isBad = Math.random() < 0.42;
+    const types = ["Dent", "Crack-like Damage", "Cut", "Hole", "Edge Damage", "Surface Defect"];
+    const locations = ["Top", "Bottom", "Left", "Right", "Center", "Top-Left", "Top-Right", "Bottom-Left", "Bottom-Right"];
+    const severities = ["Minor", "Moderate", "Major"];
+    const widthPx = 20 + Math.random() * 90;
+    const heightPx = 15 + Math.random() * 70;
+    const pxPerMm = state.pxPerMm || 9.6;
+    return {
+      status: isBad ? "BAD" : "GOOD",
+      defect_type: isBad ? types[Math.floor(Math.random() * types.length)] : "None",
+      location: isBad ? locations[Math.floor(Math.random() * locations.length)] : "—",
+      defect_count: isBad ? 1 + (Math.random() < 0.25 ? 1 : 0) : 0,
+      severity: isBad ? severities[Math.floor(Math.random() * severities.length)] : "None",
+      confidence_part: 0.95 + Math.random() * 0.04,
+      confidence_defect: isBad ? 0.88 + Math.random() * 0.1 : 0.9 + Math.random() * 0.08,
+      confidence_overall: 0.9 + Math.random() * 0.08,
+      solidity: isBad ? 0.7 + Math.random() * 0.15 : 0.9 + Math.random() * 0.08,
+      width_px: widthPx, height_px: heightPx,
+      width_mm: widthPx / pxPerMm, height_mm: heightPx / pxPerMm,
+      area_mm2: (widthPx / pxPerMm) * (heightPx / pxPerMm),
+      demo: true,
+    };
+  }
+
+  $("startInspectBtn").addEventListener("click", startInspection);
+  $("startInspectBtnBig").addEventListener("click", startInspection);
+  $("stopInspectBtn").addEventListener("click", stopInspection);
+  $("stopInspectBtnBig").addEventListener("click", stopInspection);
+  $("captureBtn").addEventListener("click", () => downloadCurrentFrame());
+  $("captureBtnBig").addEventListener("click", () => downloadCurrentFrame());
+  $("freezeBtn").addEventListener("click", () => {
+    const frozen = liveTimer !== null;
+    if (frozen) { stopLiveFeed(); $("freezeBtn").textContent = "Unfreeze"; toast("Frame frozen.", "info"); }
+    else { startLiveFeed(); $("freezeBtn").textContent = "Freeze Frame"; }
+  });
+
+  function downloadCurrentFrame() {
+    const src = $("camImg").src;
+    if (!src) return;
+    const a = document.createElement("a");
+    a.href = src;
+    a.download = `capture_${Date.now()}.jpg`;
+    a.click();
+    toast("Image download started.", "info");
+  }
+
+  /* ---------------- result rendering ---------------- */
+  function resetResultUI() {
+    const panel = $("resultPanel");
+    panel.className = "result-panel idle";
+    $("resultTitle").textContent = "SCANNING...";
+    $("resultSub").textContent = "AI is analyzing the part surface.";
+    $("resultConfidence").style.display = "none";
+  }
+
+  function applyResult(r) {
+    const panel = $("resultPanel");
+    const isGood = r.status === "GOOD";
+    panel.className = "result-panel " + (isGood ? "good" : "bad");
+
+    $("resultIcon").classList.add("animate-check");
+    setTimeout(() => $("resultIcon").classList.remove("animate-check"), 450);
+    $("resultIcon").innerHTML = isGood
+      ? `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M20 6L9 17l-5-5"/></svg>`
+      : `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M12 9v4M12 17h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/></svg>`;
+
+    $("resultTitle").textContent = isGood ? "GOOD PART" : "BAD PART";
+    $("resultSub").textContent = isGood
+      ? "No visible defect detected on the inspected surface."
+      : `${r.defect_type} detected — ${r.location.toLowerCase()} of part.`;
+    $("resultConfidence").style.display = "inline-flex";
+    $("resultConfidence").textContent = `Confidence ${(r.confidence_overall * 100).toFixed(0)}%`;
+
+    // defect info tiles
+    $("defTypeVal").textContent = isGood ? "None" : r.defect_type;
+    $("defTypeVal").className = "v " + (isGood ? "good" : "bad");
+    $("defLocVal").textContent = r.location;
+    $("defCountVal").textContent = r.defect_count;
+    $("defSolidityVal").textContent = (r.solidity * 100).toFixed(1) + "%";
+
+    // measurement
+    if (isGood) {
+      $("measWidth").textContent = "—"; $("measHeight").textContent = "—"; $("measArea").textContent = "—";
+    } else if (state.pxPerMm) {
+      $("measWidth").textContent = r.width_mm.toFixed(2) + " mm";
+      $("measHeight").textContent = r.height_mm.toFixed(2) + " mm";
+      $("measArea").textContent = r.area_mm2.toFixed(2) + " mm²";
+    } else {
+      $("measWidth").textContent = Math.round(r.width_px) + " px";
+      $("measHeight").textContent = Math.round(r.height_px) + " px";
+      $("measArea").textContent = Math.round(r.width_px * r.height_px) + " px²";
+    }
+
+    // severity
+    const sevBar = $("severityBar");
+    sevBar.className = "severity-bar";
+    if (!isGood) sevBar.classList.add(r.severity.toLowerCase());
+    $("severityLabel").textContent = isGood ? "None" : r.severity.toUpperCase();
+
+    // confidence rings
+    animateRing("ringPart", "ringPartVal", r.confidence_part);
+    animateRing("ringDefect", "ringDefectVal", r.confidence_defect);
+    animateRing("ringOverall", "ringOverallVal", r.confidence_overall);
+
+    // bbox overlay (approximate, demo visualization)
+    drawBoundingBox(isGood, r);
+
+    // voice
+    speakResult(r, isGood);
+
+    // counters + history
+    recordInspection(r, isGood);
+  }
+
+  function animateRing(circleId, valId, fraction) {
+    const c = $(circleId);
+    const circumference = 264;
+    const offset = circumference - fraction * circumference;
+    requestAnimationFrame(() => { c.style.strokeDashoffset = offset; });
+    animateNumber($(valId), fraction * 100, (v) => Math.round(v) + "%");
+  }
+
+  function drawBoundingBox(isGood, r) {
+    document.querySelectorAll(".bbox").forEach((el) => el.remove());
+    const overlay = $("camOverlay");
+    const partBox = document.createElement("div");
+    partBox.className = "bbox";
+    partBox.style.cssText = "left:20%; top:18%; width:60%; height:64%;";
+    const tag = document.createElement("span");
+    tag.className = "bbox-tag";
+    tag.textContent = "PART";
+    tag.style.color = "var(--good)";
+    partBox.appendChild(tag);
+    overlay.appendChild(partBox);
+
+    if (!isGood) {
+      const dBox = document.createElement("div");
+      dBox.className = "bbox defect";
+      const top = 25 + Math.random() * 40, left = 30 + Math.random() * 35;
+      dBox.style.cssText = `left:${left}%; top:${top}%; width:${10 + Math.random() * 10}%; height:${8 + Math.random() * 10}%;`;
+      const dTag = document.createElement("span");
+      dTag.className = "bbox-tag";
+      dTag.textContent = r.defect_type.toUpperCase();
+      dTag.style.color = "var(--bad)";
+      dBox.appendChild(dTag);
+      overlay.appendChild(dBox);
+    }
+  }
+
+  /* ---------------- voice assistant ---------------- */
+  let currentUtterance = null;
+  function speakResult(r, isGood) {
+    if (!state.voiceEnabled) return;
+    let text;
+    if (isGood) {
+      text = "Inspection complete. The part is good. No visible defect detected.";
+    } else {
+      text = `Alert. Bad part detected. A ${r.defect_type.toLowerCase()} has been detected on the ${r.location.toLowerCase()}.`;
+      if (state.pxPerMm) text += ` Estimated size is ${r.width_mm.toFixed(1)} millimeters.`;
+    }
+    speak(text);
+  }
+
+  function speak(text) {
+    if (!("speechSynthesis" in window)) return;
+    if (!state.voiceEnabled) return;
+    window.speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(text);
+    u.volume = state.volume / 100;
+    u.rate = state.rate;
+    currentUtterance = u;
+    u.onstart = () => document.querySelectorAll(".voice-indicator").forEach((v) => v.classList.add("speaking"));
+    u.onend = () => document.querySelectorAll(".voice-indicator").forEach((v) => v.classList.remove("speaking"));
+    window.speechSynthesis.speak(u);
+  }
+
+  $("voiceToggle").addEventListener("change", (e) => { state.voiceEnabled = e.target.checked; $("setVoiceEnabled").checked = e.target.checked; saveState(); });
+  $("setVoiceEnabled").addEventListener("change", (e) => { state.voiceEnabled = e.target.checked; $("voiceToggle").checked = e.target.checked; saveState(); });
+  $("testVoiceBtn").addEventListener("click", () => speak("Voice assistant is working correctly. This is a test announcement from VisionInspect AI."));
+  $("testVoiceBtn2").addEventListener("click", () => speak("Voice assistant is working correctly. This is a test announcement from VisionInspect AI."));
+
+  /* ---------------- counters ---------------- */
+  function animateNumber(el, to, formatter) {
+    const from = parseFloat(el.dataset.raw || "0");
+    const start = performance.now();
+    const dur = 700;
+    function step(now) {
+      const t = Math.min(1, (now - start) / dur);
+      const eased = 1 - Math.pow(1 - t, 3);
+      const val = from + (to - from) * eased;
+      el.textContent = formatter ? formatter(val) : Math.round(val);
+      if (t < 1) requestAnimationFrame(step); else el.dataset.raw = to;
+    }
+    requestAnimationFrame(step);
+  }
+
+  function updateCounters(animate = true) {
+    const h = state.history;
+    const total = h.length;
+    const good = h.filter((x) => x.status === "GOOD").length;
+    const bad = total - good;
+    const defects = h.reduce((s, x) => s + (x.defect_count || 0), 0);
+    const badSizes = h.filter((x) => x.status === "BAD" && x.width_mm).map((x) => (x.width_mm + x.height_mm) / 2);
+    const avgSize = badSizes.length ? (badSizes.reduce((a, b) => a + b, 0) / badSizes.length) : 0;
+    const todayStr = new Date().toDateString();
+    const today = h.filter((x) => new Date(x.ts).toDateString() === todayStr).length;
+
+    const set = (id, val) => { const el = $(id); if (animate) animateNumber(el, val); else { el.textContent = Math.round(val); el.dataset.raw = val; } };
+    set("cTotal", total); set("cGood", good); set("cBad", bad); set("cDefects", defects); set("cToday", today);
+    $("cAvgSize").textContent = avgSize.toFixed(1);
+  }
+
+  function recordInspection(r, isGood) {
+    const id = "INS-" + String(state.history.length + 1).padStart(4, "0");
+    const now = Date.now();
+    const record = {
+      id, ts: now,
+      status: r.status,
+      defect_type: isGood ? "—" : r.defect_type,
+      location: isGood ? "—" : r.location,
+      defect_count: r.defect_count || 0,
+      severity: isGood ? "—" : r.severity,
+      confidence: r.confidence_overall,
+      width_mm: r.width_mm, height_mm: r.height_mm,
+    };
+    if (state.autoSave) {
+      state.history.unshift(record);
+      saveState();
+      renderHistory();
+    }
+    updateCounters(true);
+    toast(isGood ? "Inspection saved: GOOD part." : `Inspection saved: BAD part (${r.defect_type}).`, isGood ? "good" : "bad", record.id);
+  }
+
+  /* ---------------- history table ---------------- */
+  function renderHistory() {
+    const body = $("historyBody");
+    const search = ($("historySearch").value || "").toLowerCase();
+    const filter = $("historyFilter").value;
+    const sort = $("historySort").value;
+
+    let rows = state.history.filter((r) => {
+      const matchesSearch = !search || r.id.toLowerCase().includes(search) || (r.defect_type || "").toLowerCase().includes(search);
+      const matchesFilter = filter === "all" || r.status === filter;
+      return matchesSearch && matchesFilter;
+    });
+    rows = rows.sort((a, b) => sort === "newest" ? b.ts - a.ts : a.ts - b.ts);
+
+    $("historyEmpty").style.display = rows.length ? "none" : "block";
+    body.innerHTML = rows.map((r) => {
+      const d = new Date(r.ts);
+      const size = r.width_mm ? `${r.width_mm.toFixed(1)} × ${r.height_mm.toFixed(1)}` : "—";
+      return `<tr>
+        <td>${r.id}</td>
+        <td>${d.toLocaleDateString()}</td>
+        <td>${d.toLocaleTimeString()}</td>
+        <td><span class="badge ${r.status === "GOOD" ? "good" : "bad"}">${r.status}</span></td>
+        <td>${r.defect_type}</td>
+        <td>${r.location}</td>
+        <td>${size}</td>
+        <td>${r.severity}</td>
+        <td>${(r.confidence * 100).toFixed(0)}%</td>
+        <td><div class="row-actions">
+          <button class="icon-btn" title="Delete" data-del="${r.id}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg></button>
+        </div></td>
+      </tr>`;
+    }).join("");
+
+    body.querySelectorAll("[data-del]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        state.history = state.history.filter((r) => r.id !== btn.dataset.del);
+        saveState(); renderHistory(); updateCounters(false);
+      });
+    });
+  }
+  ["historySearch", "historyFilter", "historySort"].forEach((id) => $(id).addEventListener("input", renderHistory));
+  $("clearHistoryBtn").addEventListener("click", () => {
+    if (!state.history.length) return;
+    if (confirm("Clear all inspection history? This cannot be undone.")) {
+      state.history = []; saveState(); renderHistory(); updateCounters(false);
+      toast("History cleared.", "info");
+    }
+  });
+
+  /* ---------------- analytics ---------------- */
+  function renderAnalytics() {
+    const h = state.history;
+    const good = h.filter((x) => x.status === "GOOD").length;
+    const bad = h.length - good;
+    drawDonut($("chartGoodBad"), [{ label: "Good", value: good, color: "#34e19c" }, { label: "Bad", value: bad, color: "#ff4d6d" }]);
+
+    const byDay = {};
+    h.forEach((r) => { const d = new Date(r.ts).toLocaleDateString(); byDay[d] = (byDay[d] || 0) + 1; });
+    const days = Object.keys(byDay).slice(-7);
+    drawBars($("chartDaily"), days.map((d) => ({ label: d.slice(0, 5), value: byDay[d] })), "#2dd4f4");
+
+    const types = {};
+    h.filter((x) => x.status === "BAD").forEach((r) => { types[r.defect_type] = (types[r.defect_type] || 0) + 1; });
+    renderBarList("barDefectTypes", types, "#ff4d6d");
+
+    const locs = {};
+    h.filter((x) => x.status === "BAD").forEach((r) => { locs[r.location] = (locs[r.location] || 0) + 1; });
+    renderBarList("barDefectLocations", locs, "#4f7bff");
+  }
+
+  function renderBarList(containerId, dataObj, color) {
+    const container = $(containerId);
+    const entries = Object.entries(dataObj).sort((a, b) => b[1] - a[1]);
+    const max = Math.max(1, ...entries.map((e) => e[1]));
+    if (!entries.length) { container.innerHTML = `<div class="empty-state" style="padding:16px;">No defect data yet.</div>`; return; }
+    container.innerHTML = entries.map(([label, val]) => `
+      <div class="bar-row">
+        <span>${label}</span>
+        <div class="bar-track"><div class="bar-fill" style="background:${color}; width:0%;" data-w="${(val / max) * 100}"></div></div>
+        <span>${val}</span>
+      </div>`).join("");
+    requestAnimationFrame(() => {
+      container.querySelectorAll(".bar-fill").forEach((el) => { el.style.width = el.dataset.w + "%"; });
+    });
+  }
+
+  function drawDonut(canvas, segments) {
+    const ctx = canvas.getContext("2d");
+    const dpr = window.devicePixelRatio || 1;
+    const size = canvas.clientWidth || 260;
+    canvas.width = size * dpr; canvas.height = 220 * dpr;
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, size, 220);
+    const total = segments.reduce((s, x) => s + x.value, 0) || 1;
+    const cx = size / 2, cy = 105, r = 75, lw = 26;
+    let start = -Math.PI / 2;
+    segments.forEach((seg) => {
+      const angle = (seg.value / total) * Math.PI * 2;
+      ctx.beginPath();
+      ctx.arc(cx, cy, r, start, start + angle);
+      ctx.strokeStyle = seg.color; ctx.lineWidth = lw; ctx.lineCap = "butt";
+      ctx.stroke();
+      start += angle;
+    });
+    ctx.fillStyle = "#eef3fb"; ctx.font = "600 22px 'Space Grotesk'"; ctx.textAlign = "center";
+    ctx.fillText(total, cx, cy + 8);
+    ctx.fillStyle = "#6f7c92"; ctx.font = "11px Inter"; ctx.fillText("total parts", cx, cy + 26);
+    // legend
+    let ly = 200;
+    ctx.textAlign = "left"; ctx.font = "11px Inter";
+    let lx = cx - 60;
+    segments.forEach((seg) => {
+      ctx.fillStyle = seg.color; ctx.fillRect(lx, ly - 8, 8, 8);
+      ctx.fillStyle = "#aab6c9"; ctx.fillText(`${seg.label} (${seg.value})`, lx + 12, ly);
+      lx += 90;
+    });
+  }
+
+  function drawBars(canvas, data, color) {
+    const ctx = canvas.getContext("2d");
+    const dpr = window.devicePixelRatio || 1;
+    const w = canvas.clientWidth || 260, h = 220;
+    canvas.width = w * dpr; canvas.height = h * dpr;
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, w, h);
+    if (!data.length) { ctx.fillStyle = "#6f7c92"; ctx.font = "12px Inter"; ctx.textAlign = "center"; ctx.fillText("No inspection data yet", w / 2, h / 2); return; }
+    const max = Math.max(1, ...data.map((d) => d.value));
+    const barW = Math.min(46, (w - 40) / data.length - 14);
+    const baseY = h - 30;
+    data.forEach((d, i) => {
+      const x = 24 + i * ((w - 40) / data.length);
+      const barH = (d.value / max) * (h - 70);
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.roundRect(x, baseY - barH, barW, barH, 5);
+      ctx.fill();
+      ctx.fillStyle = "#aab6c9"; ctx.font = "10px Inter"; ctx.textAlign = "center";
+      ctx.fillText(d.label, x + barW / 2, h - 12);
+      ctx.fillStyle = "#eef3fb"; ctx.font = "600 11px Inter";
+      ctx.fillText(d.value, x + barW / 2, baseY - barH - 6);
+    });
+  }
+
+  /* ---------------- settings ---------------- */
+  $("setSensitivity").addEventListener("input", (e) => { $("sensVal").textContent = e.target.value; state.sensitivity = +e.target.value; saveState(); });
+  $("setThreshold").addEventListener("input", (e) => { $("threshVal").textContent = e.target.value; state.threshold = +e.target.value; saveState(); });
+  $("setVolume").addEventListener("input", (e) => { $("volVal").textContent = e.target.value; state.volume = +e.target.value; saveState(); });
+  $("setRate").addEventListener("input", (e) => { const r = (+e.target.value / 10).toFixed(1); $("rateVal").textContent = r; state.rate = +r; saveState(); });
+  $("setAutoSave").addEventListener("change", (e) => { state.autoSave = e.target.checked; saveState(); });
+  $("setAutoInspect").addEventListener("change", (e) => { state.autoInspect = e.target.checked; saveState(); });
+  $("setLightMode").addEventListener("change", (e) => { state.lightMode = e.target.checked; document.body.classList.toggle("light", e.target.checked); saveState(); });
+
+  [["setIp", "ip"], ["setEndpoint", "endpoint"], ["setBackend", "backend"]].forEach(([id, key]) => {
+    $(id).addEventListener("change", (e) => {
+      state[key] = e.target.value.trim();
+      if (key === "ip") $("ipInput").value = state[key];
+      if (key === "endpoint") $("endpointInput").value = state[key];
+      if (key === "backend") $("backendInput").value = state[key];
+      saveState();
+      toast("Setting saved.", "info");
+    });
+  });
+
+  function updateCalibUI() {
+    if (state.pxPerMm) {
+      $("calibTag").textContent = "Calibrated";
+      $("calibResultText").textContent = `${state.pxPerMm.toFixed(2)} px/mm — measurements shown in millimeters.`;
+    } else {
+      $("calibTag").textContent = "Uncalibrated";
+      $("calibResultText").textContent = "Not calibrated — measurements shown in pixels only.";
+    }
+  }
+  $("calibrateBtn").addEventListener("click", async () => {
+    const mm = parseFloat($("calRefMm").value);
+    const px = parseFloat($("calRefPx").value);
+    if (!mm || !px) { toast("Enter both the reference width in mm and in pixels.", "bad", "Calibration incomplete"); return; }
+    state.calRefMm = mm; state.calRefPx = px; state.pxPerMm = px / mm;
+    saveState(); updateCalibUI();
+    toast(`Saved: ${state.pxPerMm.toFixed(2)} px per mm.`, "good", "Calibration saved");
+    if (await checkBackend()) {
+      fetch(state.backend.replace(/\/$/, "") + "/api/calibrate", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reference_mm: mm, reference_px: px }),
+      }).catch(() => {});
+    }
+  });
+  $("clearCalibBtn").addEventListener("click", () => {
+    state.calRefMm = null; state.calRefPx = null; state.pxPerMm = null;
+    $("calRefMm").value = ""; $("calRefPx").value = "";
+    saveState(); updateCalibUI();
+    toast("Calibration cleared.", "info");
+  });
+  updateCalibUI();
+
+  $("resetAllBtn").addEventListener("click", () => {
+    if (confirm("Reset all settings, calibration and history? This cannot be undone.")) {
+      localStorage.removeItem(LS_KEY);
+      location.reload();
+    }
+  });
+
+  $("apiDocsLink").addEventListener("click", (e) => {
+    e.preventDefault();
+    toast("Backend endpoints: GET /api/status, GET /api/frame, POST /api/connect, POST /api/inspect, GET /api/history, POST /api/calibrate. See app.py.", "info", "API reference");
+  });
+
+})();
